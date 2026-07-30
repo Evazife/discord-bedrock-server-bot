@@ -13,7 +13,7 @@ This bot is designed for Minecraft Bedrock servers hosted on Kinetic Hosting. It
 - `/list` slash command: lists currently online players.
 - `/allowlist` slash command: admin-only command that sends `allowlist add <username>` to the server console.
 - `/worldinfo` slash command: reports server status, player count, time of day, current day, and weather.
-- Basic chat helpers: supports `!ping` and `!help` text commands for quick diagnostics.
+- Basic chat helpers: supports `/help` text commands for quick diagnostics.
 
 ## Setup
 
