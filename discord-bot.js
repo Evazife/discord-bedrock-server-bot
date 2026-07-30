@@ -405,7 +405,7 @@ async function updateStatusChannel(name) {
 
   try {
     const channel = await client.channels.fetch(channelId);
-    if (channel && channel.isTextBased && channel.guild) {
+    if (channel && channel.guild && typeof channel.setName === "function") {
       await channel.setName(name);
     }
   } catch (error) {
