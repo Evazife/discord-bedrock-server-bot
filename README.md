@@ -45,6 +45,8 @@ This bot is designed for Minecraft Bedrock servers hosted on Kinetic Hosting. It
 5. Configure the environment file.
    - Copy `.env.example` to `.env`.
    - Fill in your Discord and Kinetic Panel values, as well as the Discord channel IDs.
+   - `SERVER_STATUS_CHANNEL_ID` will be updated with server online/offline status.
+   - `PLAYER_COUNT_CHANNEL_ID` will be updated with the current number of players when someone joins or leaves.
    - Any feature without a configured channel ID is automatically disabled.
    - Only the channels you want to use need to be configured.
 
@@ -83,7 +85,8 @@ This bot is designed for Minecraft Bedrock servers hosted on Kinetic Hosting. It
 - `GUILD_ID` - Guild ID for registering slash commands.
 - `SERVER_IP` - Game server IP for Bedrock ping.
 - `SERVER_PORT` - Game server port.
-- `PLAYER_COUNT_CHANNEL_ID` - Channel name updated with current player count.
+- `SERVER_STATUS_CHANNEL_ID` - Channel name updated with the server online/offline status.
+- `PLAYER_COUNT_CHANNEL_ID` - Channel name updated with the current player count whenever someone joins or leaves.
 - `CONSOLE_CHANNEL_ID` - Channel used for console relay output.
 - `JOIN_LOG_CHANNEL_ID` - Channel used for join notifications.
 - `LEAVE_LOG_CHANNEL_ID` - Channel used for leave notifications.

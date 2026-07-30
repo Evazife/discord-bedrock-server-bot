@@ -30,6 +30,91 @@ function stripAnsi(value) {
   return String(value).replace(/\u001b\[[0-9;]*m/g, "").trim();
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isDiscordRateLimitError(error) {
+  return (
+    error &&
+    (error.status === 429 || error.code === 20028 || /rate limit/i.test(String(error.message)))
+  );
+}
+
+async function safeDiscordAction(actionDescription, callback, retries = 1) {
+  try {
+    return await callback();
+  } catch (error) {
+    if (isDiscordRateLimitError(error) && retries > 0) {
+      const retryAfter = error.retryAfter ?? error.timeout ?? null;
+      const waitMs = retryAfter ? Math.ceil(retryAfter + 100) : 1000;
+      console.warn(
+        `[Discord Rate Limit] ${actionDescription} blocked. Waiting ${waitMs}ms before retrying.`
+      );
+      await delay(waitMs);
+      return safeDiscordAction(actionDescription, callback, retries - 1);
+    }
+
+    if (isDiscordRateLimitError(error)) {
+      const retryAfter = error.retryAfter ?? error.timeout ?? null;
+      console.error(
+        `[Discord Rate Limit] ${actionDescription} failed after retries. Retry after: ${retryAfter ?? "unknown"}ms`
+      );
+    }
+
+    throw error;
+  }
+}
+
+async function safeChannelSend(channel, payload) {
+  return safeDiscordAction(`send to channel ${channel.id}`, () => channel.send(payload));
+}
+
+async function safeChannelSetName(channel, name) {
+  return safeDiscordAction(`rename channel ${channel.id} to ${name}`, () => channel.setName(name));
+}
+
+async function safeInteractionEditReply(interaction, payload) {
+  return safeDiscordAction(`editReply ${interaction.id ?? interaction.user.id}`, () => interaction.editReply(payload));
+}
+
+async function safeInteractionReply(interaction, payload) {
+  return safeDiscordAction(`reply ${interaction.id ?? interaction.user.id}`, () => interaction.reply(payload));
+}
+
+const consoleMessageQueue = [];
+let consoleMessageFlushTimer = null;
+const CONSOLE_MESSAGE_MAX_LINES = 20;
+const CONSOLE_FLUSH_INTERVAL_MS = 1000;
+
+function scheduleConsoleFlush() {
+  if (consoleMessageFlushTimer) return;
+  consoleMessageFlushTimer = setTimeout(async () => {
+    consoleMessageFlushTimer = null;
+    const lines = consoleMessageQueue.splice(0, consoleMessageQueue.length);
+    if (!lines.length) return;
+
+    const content = `\`\`\`${lines.join("\n")}\`\`\``;
+    try {
+      const channel = await getConsoleChannel();
+      if (channel) {
+        await safeChannelSend(channel, content);
+      }
+    } catch (error) {
+      console.error("Failed to flush console relay messages:", error.message || error);
+    }
+  }, CONSOLE_FLUSH_INTERVAL_MS);
+}
+
+function queueConsoleMessage(text) {
+  const escaped = String(text).replace(/```/g, "`\`\`\`");
+  consoleMessageQueue.push(escaped);
+  if (consoleMessageQueue.length > CONSOLE_MESSAGE_MAX_LINES) {
+    consoleMessageQueue.splice(0, consoleMessageQueue.length - CONSOLE_MESSAGE_MAX_LINES);
+  }
+  scheduleConsoleFlush();
+}
+
 // Parse the Bedrock server "list" console output and return player counts and usernames.
 function parseListResponse(lines) {
   let count = null;
@@ -148,17 +233,7 @@ async function getConsoleChannel() {
 
 // Send a fenced code block message to the console relay channel.
 async function logConsoleChannelMessage(text) {
-  const channel = await getConsoleChannel();
-  if (!channel) return;
-
-  const escaped = String(text).replace(/```/g, "`\`\`\`");
-  const message = `\`\`\`${escaped}\`\`\``;
-
-  try {
-    await channel.send(message);
-  } catch (error) {
-    console.error("Failed to send console relay message:", error.message);
-  }
+  queueConsoleMessage(text);
 }
 
 // Detect player connect/disconnect events from server console lines.
@@ -211,8 +286,9 @@ async function sendPlayerEventEmbed(eventInfo) {
   const showCount = isEnvEnabled(isJoin ? "JOIN_LOG_SHOW_PLAYER_COUNT" : "LEAVE_LOG_SHOW_PLAYER_COUNT");
   const showList = isEnvEnabled(isJoin ? "JOIN_LOG_SHOW_ONLINE_PLAYERS" : "LEAVE_LOG_SHOW_ONLINE_PLAYERS");
 
+  const shouldFetchList = showCount || showList || !!process.env.PLAYER_COUNT_CHANNEL_ID;
   let listResult = { count: null, total: null, usernames: [] };
-  if (showCount || showList) {
+  if (shouldFetchList) {
     try {
       listResult = await requestPlayerList();
     } catch (error) {
@@ -250,9 +326,13 @@ async function sendPlayerEventEmbed(eventInfo) {
   }
 
   try {
-    await channel.send({ embeds: [embed] });
+    await safeChannelSend(channel, { embeds: [embed] });
   } catch (error) {
     console.error("Failed to send join/leave embed:", error.message);
+  }
+
+  if (process.env.PLAYER_COUNT_CHANNEL_ID) {
+    updatePlayerCountChannel(listResult).catch((error) => console.error("Failed to update player count channel:", error.message));
   }
 }
 
@@ -398,18 +478,38 @@ async function pingServer(host, port, timeout = 3000) {
   });
 }
 
-// Rename the configured status channel with the latest player count.
+// Rename the configured server status channel with the latest online/offline state.
 async function updateStatusChannel(name) {
+  const channelId = process.env.SERVER_STATUS_CHANNEL_ID || process.env.PLAYER_COUNT_CHANNEL_ID;
+  if (!channelId) return;
+
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (channel && channel.isTextBased && channel.guild) {
+      await safeChannelSetName(channel, name);
+    }
+  } catch (error) {
+    console.error("Failed to update status channel name:", error.message);
+  }
+}
+
+async function updatePlayerCountChannel(listResult) {
   const channelId = process.env.PLAYER_COUNT_CHANNEL_ID;
   if (!channelId) return;
 
   try {
     const channel = await client.channels.fetch(channelId);
-    if (channel && channel.guild && typeof channel.setName === "function") {
-      await channel.setName(name);
+    if (!channel || !channel.isTextBased || !channel.guild) return;
+
+    const countName = typeof listResult.count === "number" && typeof listResult.total === "number"
+      ? `${listResult.count}/${listResult.total} Players`
+      : "Players: Unknown";
+
+    if (channel.name !== countName) {
+      await safeChannelSetName(channel, countName);
     }
   } catch (error) {
-    console.error("Failed to update status channel name:", error.message);
+    console.error("Failed to update player count channel name:", error.message);
   }
 }
 
@@ -419,7 +519,7 @@ async function refreshServerStatus() {
   const port = Number(process.env.SERVER_PORT || 25565);
   if (!host) return;
 
-  const statusChannelId = process.env.PLAYER_COUNT_CHANNEL_ID;
+  const statusChannelId = process.env.SERVER_STATUS_CHANNEL_ID || process.env.PLAYER_COUNT_CHANNEL_ID;
   if (!statusChannelId) return;
 
   const startOffline = refreshServerStatus.offlineSince ?? null;
@@ -427,12 +527,7 @@ async function refreshServerStatus() {
   const pingResult = await pingServer(host, port, 3000);
   if (pingResult.online) {
     refreshServerStatus.offlineSince = null;
-
-    const playerCountText = typeof pingResult.count === "number" && typeof pingResult.total === "number"
-      ? `${pingResult.count}/${pingResult.total} Players`
-      : "Unknown players";
-
-    await updateStatusChannel(`🟢Online: ${playerCountText}`);
+    await updateStatusChannel("🟢 Online");
     return;
   }
 
@@ -441,7 +536,7 @@ async function refreshServerStatus() {
   }
 
   const offlineLabel = getOfflineDurationLabel(refreshServerStatus.offlineSince);
-  await updateStatusChannel(`🔴Offline: ${offlineLabel}`);
+  await updateStatusChannel(`🔴 Offline: ${offlineLabel}`);
 }
 
 // Query the server day counter and update the configured voice channel name.
@@ -459,7 +554,7 @@ async function updateDayCounterChannel() {
     if (channel && channel.guild) {
       const newName = `Day ${dayNumber}`;
       if (channel.name !== newName) {
-        await channel.setName(newName);
+        await safeChannelSetName(channel, newName);
         console.log(`Updated day counter channel to: ${newName}`);
       }
     }
@@ -860,7 +955,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .setTimestamp()
       .setFooter({ text: `Requested by ${interaction.user.tag}` });
 
-    await interaction.editReply({ embeds: [helpEmbed] });
+    await safeInteractionEditReply(interaction, { embeds: [helpEmbed] });
     return;
   }
 
@@ -879,9 +974,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTimestamp()
         .setFooter({ text: `Requested by ${interaction.user.tag}` });
 
-      await interaction.editReply({ embeds: [embed] });
+      await safeInteractionEditReply(interaction, { embeds: [embed] });
     } catch (error) {
-      await interaction.editReply(`Failed to fetch the player list: ${error.message}`);
+      await safeInteractionEditReply(interaction, `Failed to fetch the player list: ${error.message}`);
     }
 
     return;
@@ -891,21 +986,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.deferReply({ ephemeral: true });
 
     if (!(await isInteractionAdmin(interaction))) {
-      await interaction.editReply("You do not have permission to use this command.");
+      await safeInteractionEditReply(interaction, "You do not have permission to use this command.");
       return;
     }
 
     const username = interaction.options.getString("username", true).trim();
     if (!username) {
-      await interaction.editReply("Please provide a valid username.");
+      await safeInteractionEditReply(interaction, "Please provide a valid username.");
       return;
     }
 
     try {
       await sendConsoleCommand(`allowlist add ${username}`);
-      await interaction.editReply(`✅ Sent allowlist command for **${username}** to the server console.`);
+      await safeInteractionEditReply(interaction, `✅ Sent allowlist command for **${username}** to the server console.`);
     } catch (error) {
-      await interaction.editReply(`Failed to send allowlist command: ${error.message}`);
+      await safeInteractionEditReply(interaction, `Failed to send allowlist command: ${error.message}`);
     }
 
     return;
@@ -919,7 +1014,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch (err) {
       console.error("deferReply failed:", err.message);
       try {
-        await interaction.reply({ content: "Processing...", ephemeral: true });
+        await safeInteractionReply(interaction, { content: "Processing...", ephemeral: true });
         deferred = true;
       } catch (err2) {
         console.error("fallback reply failed:", err2.message);
@@ -987,11 +1082,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTimestamp()
         .setFooter({ text: `Requested by ${interaction.user.tag}` });
 
-      await interaction.editReply({ embeds: [embed] });
+      await safeInteractionEditReply(interaction, { embeds: [embed] });
     } catch (error) {
       console.error("worldinfo handler failed:", error);
       try {
-        await interaction.editReply(`Failed to fetch world info: ${error.message}`);
+        await safeInteractionEditReply(interaction, `Failed to fetch world info: ${error.message}`);
       } catch {}
     }
 
