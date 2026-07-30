@@ -292,7 +292,19 @@ async function sendPlayerEventEmbed(eventInfo) {
     try {
       listResult = await requestPlayerList();
     } catch (error) {
-      listResult = { count: null, total: null, usernames: [] };
+      console.warn("Failed to fetch player list on join/leave event, falling back to UDP ping if available:", error.message);
+      const host = process.env.SERVER_IP;
+      const port = Number(process.env.SERVER_PORT || 25565);
+      if (host) {
+        try {
+          const pingResult = await pingServer(host, port, 3000);
+          if (pingResult.online && typeof pingResult.count === "number" && typeof pingResult.total === "number") {
+            listResult = { count: pingResult.count, total: pingResult.total, usernames: [] };
+          }
+        } catch {
+          listResult = { count: null, total: null, usernames: [] };
+        }
+      }
     }
   }
 
@@ -480,14 +492,13 @@ async function pingServer(host, port, timeout = 3000) {
 
 // Rename the configured server status channel with the latest online/offline state.
 async function updateStatusChannel(name) {
-  const channelId = process.env.SERVER_STATUS_CHANNEL_ID || process.env.PLAYER_COUNT_CHANNEL_ID;
+  const channelId = process.env.SERVER_STATUS_CHANNEL_ID;
   if (!channelId) return;
 
   try {
     const channel = await client.channels.fetch(channelId);
-    if (channel && channel.isTextBased && channel.guild) {
-      await safeChannelSetName(channel, name);
-    }
+    if (!channel || !channel.guild) return;
+    await safeChannelSetName(channel, name);
   } catch (error) {
     console.error("Failed to update status channel name:", error.message);
   }
@@ -499,7 +510,7 @@ async function updatePlayerCountChannel(listResult) {
 
   try {
     const channel = await client.channels.fetch(channelId);
-    if (!channel || !channel.isTextBased || !channel.guild) return;
+    if (!channel || !channel.guild) return;
 
     const countName = typeof listResult.count === "number" && typeof listResult.total === "number"
       ? `${listResult.count}/${listResult.total} Players`
@@ -529,6 +540,17 @@ async function refreshServerStatus() {
     refreshServerStatus.offlineSince = null;
     await updateStatusChannel("🟢 Online");
     return;
+  }
+
+  // UDP ping failed, fall back to a Kinetic `list` command to verify server reachability.
+  try {
+    const listResult = await requestPlayerList();
+    refreshServerStatus.offlineSince = null;
+    await updateStatusChannel("🟢 Online");
+    await updatePlayerCountChannel(listResult).catch((error) => console.error("Failed to update player count channel after fallback list:", error.message));
+    return;
+  } catch (fallbackError) {
+    console.warn("UDP ping failed and fallback list command did not confirm server online:", fallbackError.message || fallbackError);
   }
 
   if (!startOffline) {
