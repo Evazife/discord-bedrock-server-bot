@@ -54,7 +54,7 @@ This bot is designed for Minecraft Bedrock servers hosted on Kinetic Hosting. It
 
 7. Install dependencies and start the bot:
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/Evazife/discord-bedrock-server-bot
    cd discord-bedrock-server-bot
    npm install
    cp .env.example .env
